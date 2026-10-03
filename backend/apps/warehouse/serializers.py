@@ -1,6 +1,8 @@
 """
 仓库管理序列化器
 """
+from decimal import Decimal
+
 from rest_framework import serializers
 from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
 
@@ -164,16 +166,39 @@ class StockInSerializer(serializers.ModelSerializer):
 class StockOutSerializer(serializers.ModelSerializer):
     """出库记录序列化器"""
     goods_name = serializers.CharField(source='goods.name', read_only=True)
+    goods_code = serializers.CharField(source='goods.code', read_only=True)
     operator_name = serializers.CharField(source='operator.username', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+
     class Meta:
         model = StockOut
         fields = [
-            'id', 'goods', 'goods_name', 'operator', 'operator_name',
-            'receiver', 'receiver_dept', 'quantity', 'status', 'status_display',
+            'id', 'goods', 'goods_name', 'goods_code', 'operator', 'operator_name',
+            'receiver', 'receiver_dept', 'receiver_police_no',
+            'quantity', 'status', 'status_display',
             'stock_out_time', 'remark', 'created_at'
         ]
+
+
+class StockOutCreateSerializer(serializers.Serializer):
+    """出库申请创建序列化器"""
+    goods = serializers.IntegerField(required=True, error_messages={'required': '请选择货物'})
+    receiver = serializers.CharField(min_length=1, max_length=100, required=True, error_messages={
+        'required': '请填写领用人', 'blank': '领用人不能为空',
+    })
+    receiver_dept = serializers.CharField(max_length=100, required=False, default='', allow_blank=True)
+    receiver_police_no = serializers.CharField(max_length=50, required=False, default='', allow_blank=True)
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'),
+                                        required=True, error_messages={
+        'required': '请填写出库数量', 'invalid': '出库数量格式不正确',
+        'min_value': '出库数量必须大于0',
+    })
+    remark = serializers.CharField(max_length=500, required=False, default='', allow_blank=True)
+
+    def validate_goods(self, value):
+        if not Goods.objects.filter(pk=value, is_active=True).exists():
+            raise serializers.ValidationError('货物不存在或已停用')
+        return value
 
 
 class WarningSerializer(serializers.ModelSerializer):

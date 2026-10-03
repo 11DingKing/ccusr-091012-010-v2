@@ -174,6 +174,7 @@ class StockOut(models.Model):
     )
     receiver = models.CharField('领用人', max_length=100)
     receiver_dept = models.CharField('领用部门', max_length=100, blank=True)
+    receiver_police_no = models.CharField('领用人警号', max_length=50, blank=True)
     quantity = models.DecimalField('出库数量', max_digits=12, decimal_places=2)
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     stock_out_time = models.DateTimeField('出库时间', null=True, blank=True)

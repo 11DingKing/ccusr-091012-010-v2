@@ -15,9 +15,10 @@ from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer, StockInSerializer, StockOutSerializer, StockOutCreateSerializer,
     WarningSerializer, ApprovalSerializer
 )
+from . import services as stock_services
 
 logger = logging.getLogger('apps')
 
@@ -600,16 +601,145 @@ class StockInListView(APIView):
 
 
 class StockOutListView(APIView):
-    """出库记录列表视图"""
+    """出库申请列表 / 创建出库申请"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockOut.objects.select_related('goods', 'operator').all().order_by('-created_at')
+
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = int(request.query_params.get('page_size', 10))
+        total = queryset.count()
+        items = queryset[(page - 1) * page_size: page * page_size]
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockOutSerializer(items, many=True).data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        """创建出库申请（待审批）"""
+        serializer = StockOutCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        goods = Goods.objects.get(pk=data['goods'])
+        stock_out = StockOut.objects.create(
+            goods=goods,
+            operator=request.user,
+            receiver=data['receiver'],
+            receiver_dept=data.get('receiver_dept', ''),
+            receiver_police_no=data.get('receiver_police_no', ''),
+            quantity=data['quantity'],
+            remark=data.get('remark', ''),
+            status='pending',
+        )
+        logger.info(f"用户 {request.user.username} 创建出库申请 #{stock_out.id}")
+        return success_response(data=StockOutSerializer(stock_out).data, message='出库申请已提交')
+
+
+class StockOutDetailView(APIView):
+    """出库详情，含本次使用的豁免依据"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        stock_out = StockOut.objects.select_related('goods', 'operator').filter(pk=pk).first()
+        if stock_out is None:
+            return error_response(message='出库记录不存在', code=404)
+        data = StockOutSerializer(stock_out).data
+        # 关联的豁免消费（审计线索）
+        from apps.exemptions.services import audit_record
+        from apps.exemptions.models import ExemptionUsage
+        usages = ExemptionUsage.objects.filter(
+            target_action='warehouse.stock_out',
+            target_ref__stock_out_id=stock_out.id,
+        ).select_related('rule', 'exemption', 'consumer')
+        data['exemption_usages'] = [audit_record(u) for u in usages]
+        return success_response(data=data)
+
+
+class StockOutApprovalView(APIView):
+    """审批出库申请"""
+    permission_classes = [IsAuthenticated]
+    approve = True  # 由路由通过 as_view(approve=...) 覆盖
+
+    def post(self, request, pk):
+        if not request.user.is_admin:
+            return error_response(message='仅管理员可以审批出库申请', code=403)
+        stock_out = StockOut.objects.filter(pk=pk).first()
+        if stock_out is None:
+            return error_response(message='出库记录不存在', code=404)
+        if stock_out.status != 'pending':
+            return error_response(message='仅待审批的出库申请可以审批')
+
+        remark = str(request.data.get('remark', ''))
+        stock_out.status = 'approved' if self.approve else 'rejected'
+        stock_out.save(update_fields=['status'])
+        Approval.objects.create(
+            stock_out=stock_out,
+            approver=request.user,
+            status='approved' if self.approve else 'rejected',
+            remark=remark,
+        )
+        logger.info(
+            f"管理员 {request.user.username} {'批准' if self.approve else '拒绝'}出库申请 #{pk}"
+        )
+        return success_response(
+            data=StockOutSerializer(stock_out).data,
+            message='已批准' if self.approve else '已拒绝',
+        )
+
+
+class StockOutExecuteView(APIView):
+    """
+    执行出库（目标操作）。触发容量/时段/资质限制时，
+    必须存在已批准且可用的豁免，否则操作被阻断。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        stock_out = StockOut.objects.filter(pk=pk).first()
+        if stock_out is None:
+            return error_response(message='出库记录不存在', code=404)
+        try:
+            stock_out, usages = stock_services.execute_stock_out(
+                stock_out_id=pk, operator=request.user
+            )
+        except stock_services.StockOutBlocked as exc:
+            logger.warning(
+                f"出库 #{pk} 被规则阻断：{exc.message if hasattr(exc, 'message') else exc}"
+            )
+            return error_response(
+                message=str(exc),
+                data={'violations': exc.violations},
+            )
+        except stock_services.StockOutError as exc:
+            return error_response(message=str(exc))
+
+        logger.info(
+            f"用户 {request.user.username} 执行出库 #{pk}，使用豁免 {usages.count()} 条"
+        )
+        return success_response(
+            data={
+                'stock_out': StockOutSerializer(stock_out).data,
+                'exempted_violations': usages.count(),
+            },
+            message='出库成功',
+        )
 
 
 class WarningListView(APIView):
